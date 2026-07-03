@@ -23,19 +23,22 @@ class PerceptionNode(Node):
 
         self.bridge = CvBridge()
         self.fov_hor = math.radians(90.0)
-        # lookahead_distance đồng bộ với Ld mới của planning = 7.0 m
-        self.lookahead_distance = 7.0
+        # lookahead_distance đồng bộ với Ld mới của planning
+        self.lookahead_distance = 7.5
+        self.roi_center_ratio = 0.40
+        self.roi_height_ratio = 0.30
         self.image_width = None
 
         # LiDAR
-        self.obstacle_min_z = 0.5
-        self.lane_check_dist = 25.0
+        self.obstacle_min_z = 0.2
+        self.obstacle_min_x = 0.3     # bỏ qua vật cản ngay sát/phía sau xe
+        self.lane_check_dist = 30.0
         self.lane_offset = 3.5
-        self.lane_tolerance = 1.5
+        self.lane_tolerance = 2.0
         self.clear_threshold = 10.0
 
-        # Điểm bám cách mép phải 20% chiều rộng làn (dịch sang phải)
-        self.lateral_offset_ratio = 0.20
+        # Điểm bám cách mép phải 25% chiều rộng làn (dịch sang trái nhẹ)
+        self.lateral_offset_ratio = 0.25
 
         self.last_camera_time = 0.0
         self.last_lidar_time = 0.0
@@ -44,7 +47,7 @@ class PerceptionNode(Node):
         self.filtered_error = 0.0
         self.error_alpha = 0.4          # lọc nhẹ
 
-        self.get_logger().info("Perception (right edge only, Ld=7) started!")
+        self.get_logger().info("Perception (right edge, lower-mid ROI) started!")
 
     def camera_callback(self, msg):
         try:
@@ -64,25 +67,45 @@ class PerceptionNode(Node):
                 self.image_width = w
                 self.get_logger().info(f"Image width: {w}")
 
-            # 2. Mặt đường (dark purple) – loại bỏ vỉa hè
-            lower_road = np.array([110, 45, 110])
-            upper_road = np.array([145, 80, 145])
+            # 2. Mặt đường (dark purple) – loại bỏ vỉa hè và nhiễu nhỏ
+            lower_road = np.array([100, 35, 95])
+            upper_road = np.array([155, 95, 155])
             mask_road = cv2.inRange(frame, lower_road, upper_road)
 
-            lower_sidewalk = np.array([210, 20, 225])
-            upper_sidewalk = np.array([255, 55, 255])
+            lower_sidewalk = np.array([200, 20, 220])
+            upper_sidewalk = np.array([255, 60, 255])
             mask_sidewalk = cv2.inRange(frame, lower_sidewalk, upper_sidewalk)
             mask_road = cv2.bitwise_and(mask_road, cv2.bitwise_not(mask_sidewalk))
 
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
             mask_road = cv2.morphologyEx(mask_road, cv2.MORPH_CLOSE, kernel, iterations=1)
+            mask_road = cv2.morphologyEx(mask_road, cv2.MORPH_OPEN, kernel, iterations=1)
 
-            # 3. ROI thấp: 70% → 85% (rất gần)
-            y_start = int(h * 0.70)
-            y_end   = int(h * 0.85)
+            # 3. Lọc nhiễu bằng connected components TRƯỚC khi cắt ROI
+            #    (trước đây roi được cắt từ mask_road cũ nên bước lọc này không có
+            #     tác dụng gì tới việc tìm mép làn — đã sửa lại thứ tự cho đúng)
+            full_area = h * w
+            min_component_area = max(120, int(full_area * 0.0015))
+            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_road, connectivity=8)
+            if num_labels > 1:
+                filtered_mask = np.zeros_like(mask_road)
+                for i in range(1, num_labels):
+                    area = stats[i, cv2.CC_STAT_AREA]
+                    if area >= min_component_area:
+                        filtered_mask[labels == i] = 255
+                mask_road = filtered_mask
+            else:
+                mask_road = np.zeros_like(mask_road)
+
+            # 4. ROI ở vùng nhìn xa hơn (giữa-đỉnh ảnh) để giảm cua sớm
+            #    Cắt SAU khi mask_road đã được lọc nhiễu ở trên.
+            y_center = int(h * self.roi_center_ratio)
+            roi_height = max(20, int(h * self.roi_height_ratio))
+            y_start = max(0, y_center - roi_height // 2)
+            y_end = min(h, y_center + roi_height // 2)
             roi = mask_road[y_start:y_end, :]
 
-            # 4. Tìm mép phải (trung vị)
+            # 5. Tìm mép phải (trung vị)
             right_edges = []
             for row in range(roi.shape[0]):
                 road_pixels = np.nonzero(roi[row, :])[0]
@@ -94,24 +117,24 @@ class PerceptionNode(Node):
             else:
                 right_edge = int(np.median(right_edges))
 
-                # 5. Tính chiều rộng làn (pixel) tại lookahead_distance
+                # 6. Tính chiều rộng làn (pixel) tại lookahead_distance
                 width_m = 2.0 * self.lookahead_distance * math.tan(self.fov_hor / 2.0)
                 meter_per_pixel = width_m / self.image_width
                 lane_width_px = 3.5 / meter_per_pixel
 
-                # 6. Target point: lùi sang trái 1 khoảng tỉ lệ
+                # 7. Target point: lùi sang trái 1 khoảng tỉ lệ
                 target_x = right_edge - (lane_width_px * self.lateral_offset_ratio)
 
-                # 7. Lỗi pixel
+                # 8. Lỗi pixel
                 error_px = target_x - (w / 2.0)
 
-                # 8. Đổi sang mét
+                # 9. Đổi sang mét
                 lookahead_error_m = error_px * meter_per_pixel
 
                 if abs(lookahead_error_m) < 0.001:
                     lookahead_error_m = 0.0
 
-            # 9. Lọc & publish
+            # 10. Lọc & publish
             self.filtered_error = self.error_alpha * self.filtered_error + (1 - self.error_alpha) * lookahead_error_m
             msg_out = Float32()
             msg_out.data = self.filtered_error
@@ -123,7 +146,6 @@ class PerceptionNode(Node):
             self.get_logger().error(f"Camera error: {e}")
 
     def lidar_callback(self, msg):
-        # Giữ nguyên, không thay đổi
         try:
             now = time.time()
             if now - self.last_lidar_time < self.min_interval:
@@ -139,20 +161,28 @@ class PerceptionNode(Node):
                 counter += 1
                 if counter % 4 != 0:
                     continue
-                if x < 2.0 or z < self.obstacle_min_z:
+
+                if z < self.obstacle_min_z:
                     continue
 
-                if abs(y) < 1.5:
-                    if x < min_dist_obs:
-                        min_dist_obs = x
+                if x < -self.lane_check_dist or x > self.lane_check_dist:
+                    continue
 
-                if 0 < x < self.lane_check_dist:
+                distance = abs(x)
+
+                # Chỉ tính vật cản PHÍA TRƯỚC xe (x > 0) để tránh xe/vật phía sau
+                # trong cùng làn kích hoạt phanh vô lý.
+                if x > self.obstacle_min_x and abs(y) < 2.0:
+                    if distance < min_dist_obs:
+                        min_dist_obs = distance
+
+                if 0.3 < distance < self.lane_check_dist:
                     if self.lane_offset - self.lane_tolerance < y < self.lane_offset + self.lane_tolerance:
-                        if x < min_x_left:
-                            min_x_left = x
+                        if distance < min_x_left:
+                            min_x_left = distance
                     if -self.lane_offset - self.lane_tolerance < y < -self.lane_offset + self.lane_tolerance:
-                        if x < min_x_right:
-                            min_x_right = x
+                        if distance < min_x_right:
+                            min_x_right = distance
 
             obs_msg = Bool()
             dist_msg = Float32()
