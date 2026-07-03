@@ -30,30 +30,36 @@ class PlanningNode(Node):
         self.L = 2.9
 
         # Tham số cho hai chế độ
-        self.Ld_straight = 6.0
-        self.gain_straight = 0.8
-        self.Ld_curve = 14.0
-        self.gain_curve = 1.4
-        self.max_steer = 0.4
+        self.lookahead_time = 0.55
+        self.lookahead_distance_min = 3.0
+        self.lookahead_distance_max = 12.0
+        self.lookahead_curve_buffer = 2.0
+        self.gain_straight = 0.75
+        self.gain_curve = 1.0
+        self.max_steer = 0.5
 
         # Tốc độ (m/s)
-        self.target_speed = 5.56
-        self.slow_speed = 2.5
-        self.lane_change_speed = 2.0
+        self.target_speed = 11.11  # 40 km/h
+        self.slow_speed = 3.5
+        self.lane_change_speed = 4.0
 
-        # Ngưỡng vật cản
-        self.stop_dist = 5.0
-        self.resume_dist = 8.0
-        self.slow_down_dist = 15.0
-        self.lane_change_min_dist = 3.0
+        # Ngưỡng vật cản (có hysteresis rõ ràng để tránh chattering trạng thái)
+        self.stop_dist = 3.0
+        self.resume_dist = 8.0          # < lane_change_trigger_dist để tạo đệm
+        self.slow_down_dist = 10.0
+        self.lane_change_trigger_dist = 13.0
+        self.lane_change_min_dist = 2.0
 
         # Lane change
-        self.lane_change_offset = 0.8
-        self.lane_change_min_time = 100
+        self.lane_change_offset = 1.25
+        self.lane_change_min_time = 80
         self.lane_change_timer = 0
         self.lane_change_target = None
         self.lane_change_cooldown = 0
         self.lane_change_cooldown_max = 200
+
+        self.brake_hold_time = 20
+        self.brake_timer = 0
 
         # ---- Phát hiện cua dựa trên GÓC LÁI ----
         self.in_curve = False
@@ -73,6 +79,14 @@ class PlanningNode(Node):
     def odom_callback(self, msg):
         self.current_velocity = math.sqrt(msg.twist.twist.linear.x**2 + msg.twist.twist.linear.y**2)
 
+    def compute_lookahead_distance(self, in_curve=False):
+        speed_mps = max(0.1, self.current_velocity)
+        Ld = speed_mps * self.lookahead_time
+        Ld = max(self.lookahead_distance_min, min(self.lookahead_distance_max, Ld))
+        if in_curve:
+            Ld = min(self.lookahead_distance_max, Ld + self.lookahead_curve_buffer)
+        return Ld
+
     def compute_steering(self, error, Ld, gain):
         amplified = error * gain
         alpha = math.atan2(amplified, Ld)
@@ -83,8 +97,9 @@ class PlanningNode(Node):
         if self.lane_change_cooldown > 0:
             self.lane_change_cooldown -= 1
 
-        # Luôn tính góc lái ở chế độ đường thẳng để phát hiện cua
-        steer_straight = self.compute_steering(self.lookahead_error, self.Ld_straight, self.gain_straight)
+        # Luôn tính góc lái bằng Ld động để phát hiện cua đúng hơn
+        dynamic_ld_for_detection = self.compute_lookahead_distance(False)
+        steer_straight = self.compute_steering(self.lookahead_error, dynamic_ld_for_detection, self.gain_straight)
 
         # Cập nhật trạng thái cua dựa trên steer_straight
         if not self.in_curve:
@@ -102,10 +117,10 @@ class PlanningNode(Node):
 
         # Chọn Ld và gain theo trạng thái cua
         if self.in_curve:
-            Ld = self.Ld_curve
+            Ld = self.compute_lookahead_distance(True)
             gain = self.gain_curve
         else:
-            Ld = self.Ld_straight
+            Ld = self.compute_lookahead_distance(False)
             gain = self.gain_straight
 
         # Tính góc lái cuối cùng với Ld/gain đã chọn
@@ -113,41 +128,62 @@ class PlanningNode(Node):
         speed = self.target_speed
 
         # FSM
-        if self.state == "STOP":
-            steer = 0.0
-            speed = 0.0
-            if not self.obstacle_detected or self.obstacle_dist > self.resume_dist:
-                self.state = "LANE_FOLLOWING"
-            elif self.obstacle_detected and self.obstacle_dist < self.lane_change_min_dist:
-                if self.lane_left_clear and self.lane_change_cooldown == 0:
-                    self.state = "LANE_CHANGE_LEFT"
-                    self.lane_change_timer = 0
-                    self.lane_change_target = "left"
-                elif self.lane_right_clear and self.lane_change_cooldown == 0:
-                    self.state = "LANE_CHANGE_RIGHT"
-                    self.lane_change_timer = 0
-                    self.lane_change_target = "right"
-
-        elif self.state in ("LANE_CHANGE_LEFT", "LANE_CHANGE_RIGHT"):
+        if self.state in ("LANE_CHANGE_LEFT", "LANE_CHANGE_RIGHT"):
             self.lane_change_timer += 1
             sign = -1.0 if self.state == "LANE_CHANGE_LEFT" else 1.0
             error = self.lookahead_error + sign * self.lane_change_offset
             steer = self.compute_steering(error, Ld, gain)
             speed = self.lane_change_speed
-            if self.lane_change_timer > self.lane_change_min_time:
+            if self.lane_change_timer > self.lane_change_min_time or abs(error) < 0.25:
+                self.get_logger().info(f"LANE_CHANGE complete (timer={self.lane_change_timer}, error={error:.3f}) -> LANE_FOLLOWING")
                 self.state = "LANE_FOLLOWING"
                 self.lane_change_cooldown = self.lane_change_cooldown_max
                 self.lane_change_target = None
 
+        elif self.state == "BRAKE":
+            self.brake_timer += 1
+            steer = self.compute_steering(self.lookahead_error, Ld, gain)
+            # Dùng resume_dist (hysteresis) thay vì slow_down_dist để tránh
+            # trạng thái nhấp nháy khi obstacle_dist dao động quanh ngưỡng vào (20m).
+            if not self.obstacle_detected or self.obstacle_dist > self.resume_dist:
+                self.state = "LANE_FOLLOWING"
+                self.brake_timer = 0
+                self.lane_change_target = None
+            else:
+                speed = 0.0
+                if self.brake_timer >= self.brake_hold_time:
+                    if self.lane_change_target == "left":
+                        self.get_logger().info("BRAKE: hold complete -> initiating LANE_CHANGE_LEFT")
+                        self.state = "LANE_CHANGE_LEFT"
+                        self.lane_change_timer = 0
+                    elif self.lane_change_target == "right":
+                        self.get_logger().info("BRAKE: hold complete -> initiating LANE_CHANGE_RIGHT")
+                        self.state = "LANE_CHANGE_RIGHT"
+                        self.lane_change_timer = 0
+                    else:
+                        self.get_logger().info("BRAKE: hold complete but no lane target -> resuming LANE_FOLLOWING")
+                        self.state = "LANE_FOLLOWING"
+                        self.brake_timer = 0
+
         else:  # LANE_FOLLOWING
             steer = self.compute_steering(self.lookahead_error, Ld, gain)
-            if self.obstacle_detected:
-                if self.obstacle_dist < self.stop_dist:
-                    self.state = "STOP"
-                elif self.obstacle_dist < self.slow_down_dist:
-                    speed = self.slow_speed
-            if abs(steer) > 0.5:
-                speed = max(2.0, self.target_speed * 0.6)
+            speed = self.target_speed
+            if self.obstacle_detected and self.obstacle_dist <= self.lane_change_trigger_dist:
+                self.get_logger().info(f"Obstacle detected ahead at {self.obstacle_dist:.2f} m -> entering BRAKE")
+                self.state = "BRAKE"
+                self.brake_timer = 0
+                if self.lane_left_clear and self.lane_change_cooldown == 0:
+                    self.lane_change_target = "left"
+                    self.get_logger().info("BRAKE: lane_left_clear -> plan LANE_CHANGE_LEFT after hold")
+                elif self.lane_right_clear and self.lane_change_cooldown == 0:
+                    self.lane_change_target = "right"
+                    self.get_logger().info("BRAKE: lane_right_clear -> plan LANE_CHANGE_RIGHT after hold")
+                else:
+                    self.lane_change_target = None
+                    self.get_logger().info("BRAKE: no adjacent lane available, holding")
+                speed = 0.0
+            if self.state == "LANE_FOLLOWING" and abs(steer) > 0.45:
+                speed = max(self.lane_change_speed, self.target_speed * 0.5)
 
         # Publish
         steer_msg = Float32()
@@ -163,8 +199,9 @@ class PlanningNode(Node):
         self.state_pub.publish(state_msg)
 
         self.get_logger().info(
-            f"{self.state} | Curve={self.in_curve} | Err={self.lookahead_error:.3f}m | Ld={Ld:.1f} gain={gain:.2f} Steer={steer:.2f}",
+            f"{self.state} | Curve={self.in_curve} | Vel={self.current_velocity:.2f}m/s | Err={self.lookahead_error:.3f}m | Ld={Ld:.1f} gain={gain:.2f} Steer={steer:.2f}",
             throttle_duration_sec=0.5)
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -172,6 +209,7 @@ def main(args=None):
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
+
 
 if __name__ == "__main__":
     main()
