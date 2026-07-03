@@ -6,7 +6,7 @@ cd ~/carla
 
 
 
-Terminal 2 — ROS Bridge:
+    Terminal 2 — ROS Bridge:
 source /opt/ros/humble/setup.bash
 source ~/ros2_ws/install/setup.bash
 ros2 launch carla_ros_bridge carla_ros_bridge_with_example_ego_vehicle.launch.py timeout:=60
@@ -24,9 +24,9 @@ source /opt/ros/humble/setup.bash
 source ~/ros2_ws/install/setup.bash
 ros2 run autonomous_driving npc_velocity_manager
 
-build
+    build
 cd ~/ros2_ws && colcon build --packages-select autonomous_driving && source ~/.bashrc
 
-cammera
+    cammera sematic
 unset GTK_PATH
 ros2 run rqt_image_view rqt_image_view
