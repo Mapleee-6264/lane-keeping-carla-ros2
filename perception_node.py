@@ -29,8 +29,13 @@ class PerceptionNode(Node):
         self.roi_height_ratio = 0.30
         self.image_width = None
 
+        self.camera_obstacle_detected = False
+        self.camera_obstacle_distance = 999.0
+        self.vehicle_color_lower = np.array([0, 0, 130])
+        self.vehicle_color_upper = np.array([60, 60, 180])
+
         # LiDAR
-        self.obstacle_min_z = 0.2
+        self.obstacle_min_z = 0.0
         self.obstacle_min_x = 0.3     # bỏ qua vật cản ngay sát/phía sau xe
         self.lane_check_dist = 30.0
         self.lane_offset = 3.5
@@ -80,6 +85,20 @@ class PerceptionNode(Node):
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
             mask_road = cv2.morphologyEx(mask_road, cv2.MORPH_CLOSE, kernel, iterations=1)
             mask_road = cv2.morphologyEx(mask_road, cv2.MORPH_OPEN, kernel, iterations=1)
+
+            mask_vehicle = cv2.inRange(frame, self.vehicle_color_lower, self.vehicle_color_upper)
+            mask_vehicle = cv2.morphologyEx(mask_vehicle, cv2.MORPH_CLOSE, kernel, iterations=1)
+            mask_vehicle = cv2.morphologyEx(mask_vehicle, cv2.MORPH_OPEN, kernel, iterations=1)
+            vehicle_pixels = cv2.countNonZero(mask_vehicle)
+            if vehicle_pixels > 80:
+                vehicle_positions = np.column_stack(np.where(mask_vehicle > 0))
+                bottom_y = int(np.max(vehicle_positions[:, 0]))
+                rel = max(0.0, min(1.0, (h - bottom_y) / float(h)))
+                self.camera_obstacle_detected = True
+                self.camera_obstacle_distance = float(max(1.0, min(25.0, 1.0 + rel * 24.0)))
+            else:
+                self.camera_obstacle_detected = False
+                self.camera_obstacle_distance = 999.0
 
             # 3. Lọc nhiễu bằng connected components TRƯỚC khi cắt ROI
             #    (trước đây roi được cắt từ mask_road cũ nên bước lọc này không có
@@ -159,7 +178,7 @@ class PerceptionNode(Node):
             counter = 0
             for x, y, z in pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True):
                 counter += 1
-                if counter % 4 != 0:
+                if counter % 2 != 0:
                     continue
 
                 if z < self.obstacle_min_z:
@@ -183,6 +202,9 @@ class PerceptionNode(Node):
                     if -self.lane_offset - self.lane_tolerance < y < -self.lane_offset + self.lane_tolerance:
                         if distance < min_x_right:
                             min_x_right = distance
+
+            if self.camera_obstacle_detected and self.camera_obstacle_distance < min_dist_obs:
+                min_dist_obs = self.camera_obstacle_distance
 
             obs_msg = Bool()
             dist_msg = Float32()
