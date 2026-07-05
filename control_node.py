@@ -19,11 +19,11 @@ class ControlNode(Node):
         self.current_speed = 0.0
 
         self.last_steer = 0.0
-        self.max_steer_rate = 1.2
+        self.max_steer_rate = 1.5
 
         self.Kp = 0.5
         self.Ki = 0.1
-        self.ff_gain = 0.15
+        self.ff_gain = 0.20       # tăng ga ngay khi cần tăng tốc
         self.integral = 0.0
         self.max_integral = 1.5
         self.deadband = 0.1
@@ -31,8 +31,8 @@ class ControlNode(Node):
 
         self.last_throttle = 0.0
         self.last_brake = 0.0
-        self.throttle_rate = 3.0
-        self.brake_rate = 10.0
+        self.throttle_rate = 6.0  # tăng tốc độ tăng ga để rời khỏi trạng thái phanh nhanh hơn
+        self.brake_rate = 8.0     # giữ phanh vừa đủ, không quá cứng
 
         self.timer = self.create_timer(self.dt, self.control_loop)
         self.get_logger().info("Control Node (gentle) started!")
