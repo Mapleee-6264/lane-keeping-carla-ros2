@@ -43,7 +43,7 @@ class PlanningNode(Node):
         self.lookahead_distance_min = 3.0
         self.lookahead_distance_max = 12.0
         self.lookahead_curve_buffer = 2.0
-        self.gain_straight = 0.8
+        self.gain_straight = 0.75
         self.gain_curve = 1.1
         self.max_steer = 0.6
 
@@ -54,11 +54,11 @@ class PlanningNode(Node):
 
         # ---- Ngưỡng vật cản loại "other" (không phải xe hơi) ----
         self.other_slow_dist = 9.0                      # < 8m: slow down + tìm tâm làn trống
-        self.other_lane_change_completion_error = 5.0   # đạt tâm làn (sai số < 0.5m) -> về lane following
+        self.other_lane_change_completion_error = 0.5   # đạt tâm làn (sai số < 0.5m) -> về lane following
 
         # ---- Ngưỡng vật cản loại "vehicle" (xe hơi), chỉ xét khi ở nửa phải đường ----
         self.car_slow_dist = 16            # < 15m: slow down
-        self.car_avoid_dist = 15.0            # < 8m: né tạm sang trái
+        self.car_avoid_dist = 12          # < 8m: né tạm sang trái
         self.car_avoid_hold_time = 300       # số chu kỳ (2s @ 50Hz) giữ tâm làn tạm rồi tự trả về lane following
 
         # Lane change (dùng cho AVOID_OTHER)
@@ -142,7 +142,7 @@ class PlanningNode(Node):
         left_lane_error = self.road_left_edge_error + self.lane_follow_offset_m   # tâm làn trái
         road_center_error = (self.road_left_edge_error + self.road_right_edge_error) / 2.0
         # Tâm làn tạm khi né xe: trung điểm giữa mép trái đường và tâm đường
-        avoid_car_target_error = (self.road_left_edge_error + road_center_error) / 2.0
+        avoid_car_target_error = (self.road_left_edge_error *0.85+ road_center_error*0.15) 
 
         current_lane_error = right_lane_error if self.current_lane == "right" else left_lane_error
 
