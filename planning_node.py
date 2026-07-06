@@ -43,33 +43,32 @@ class PlanningNode(Node):
         self.lookahead_distance_min = 3.0
         self.lookahead_distance_max = 12.0
         self.lookahead_curve_buffer = 2.0
-        self.gain_straight = 0.75
-        self.gain_curve = 1.0
-        self.max_steer = 0.5
+        self.gain_straight = 0.9
+        self.gain_curve = 1.1
+        self.max_steer = 0.6
 
         # Tốc độ (m/s)
         self.target_speed = 11.11  # 40 km/h
         self.slow_speed = 3.5
         self.lane_change_speed = 4.0
 
-        # Ngưỡng vật cản (có hysteresis rõ ràng để tránh chattering trạng thái)
-        self.stop_dist = 2.5
-        self.resume_dist = 10.0          # < lane_change_trigger_dist để tạo đệm
-        self.slow_down_dist = 8.0
-        self.lane_change_trigger_dist = 20.0
-        self.lane_change_min_dist = 2.0
+        # ---- Ngưỡng vật cản loại "other" (không phải xe hơi) ----
+        self.other_slow_dist = 9.0                      # < 8m: slow down + tìm tâm làn trống
+        self.other_lane_change_completion_error = 5.0   # đạt tâm làn (sai số < 0.5m) -> về lane following
 
-        # Lane change
-        self.lane_follow_offset_ratio = 0.25
+        # ---- Ngưỡng vật cản loại "vehicle" (xe hơi), chỉ xét khi ở nửa phải đường ----
+        self.car_slow_dist = 15.5            # < 15m: slow down
+        self.car_avoid_dist = 15.0            # < 8m: né tạm sang trái
+        self.car_avoid_hold_time = 300       # số chu kỳ (2s @ 50Hz) giữ tâm làn tạm rồi tự trả về lane following
+
+        # Lane change (dùng cho AVOID_OTHER)
+        self.lane_follow_offset_ratio = 0.50
         self.lane_follow_offset_m = 3.5 * self.lane_follow_offset_ratio
-        self.lane_change_min_time = 80
-        self.lane_change_timer = 0
-        self.lane_change_target = None
-        self.lane_change_cooldown = 0
-        self.lane_change_cooldown_max = 200
+        self.lane_change_steer_gain = 1.35
+        self.lane_change_lookahead_min = 4.0
 
-        self.brake_hold_time = 20
-        self.brake_timer = 0
+        self.avoid_other_target_lane = None   # "left" hoặc "right": làn đang né tới
+        self.avoid_car_timer = 0
 
         # ---- Phát hiện cua dựa trên GÓC LÁI ----
         self.in_curve = False
@@ -108,9 +107,6 @@ class PlanningNode(Node):
         return max(-self.max_steer, min(self.max_steer, delta))
 
     def planning_loop(self):
-        if self.lane_change_cooldown > 0:
-            self.lane_change_cooldown -= 1
-
         # Luôn tính góc lái bằng Ld động để phát hiện cua đúng hơn
         dynamic_ld_for_detection = self.compute_lookahead_distance(False)
         steer_straight = self.compute_steering(self.lookahead_error, dynamic_ld_for_detection, self.gain_straight)
@@ -141,82 +137,78 @@ class PlanningNode(Node):
         steer = self.compute_steering(self.lookahead_error, Ld, gain)
         speed = self.target_speed
 
-        # FSM
-        right_lane_error = self.lookahead_error
-        left_lane_error = self.road_left_edge_error + self.lane_follow_offset_m
+        # ---- Các "tâm làn" có thể dùng ----
+        right_lane_error = self.lookahead_error                              # tâm làn phải (mặc định)
+        left_lane_error = self.road_left_edge_error + self.lane_follow_offset_m   # tâm làn trái
+        road_center_error = (self.road_left_edge_error + self.road_right_edge_error) / 2.0
+        # Tâm làn tạm khi né xe: trung điểm giữa mép trái đường và tâm đường
+        avoid_car_target_error = (self.road_left_edge_error + road_center_error) / 2.0
+
         current_lane_error = right_lane_error if self.current_lane == "right" else left_lane_error
 
-        if self.state in ("LANE_CHANGE_LEFT", "LANE_CHANGE_RIGHT"):
-            self.lane_change_timer += 1
-            completed_direction = self.state
-            target_error = left_lane_error if self.state == "LANE_CHANGE_LEFT" else right_lane_error
-            steer = self.compute_steering(target_error, Ld, gain)
-            speed = self.lane_change_speed
-            if self.lane_change_timer > self.lane_change_min_time or abs(target_error - current_lane_error) < 0.25:
-                self.get_logger().info(f"LANE_CHANGE complete (timer={self.lane_change_timer}, target_error={target_error:.3f}) -> LANE_FOLLOWING")
-                self.state = "LANE_FOLLOWING"
-                self.lane_change_cooldown = self.lane_change_cooldown_max
-                self.lane_change_target = None
-                self.current_lane = "left" if completed_direction == "LANE_CHANGE_LEFT" else "right"
+        # Vật cản "vehicle" ở nửa trái đường (mép trái -> tâm đường) thì bỏ qua hoàn toàn
+        car_relevant = self.obstacle_type == "vehicle" and self.obstacle_detected and self.obstacle_vehicle_side == "right"
+        other_relevant = self.obstacle_type == "other" and self.obstacle_detected
 
-        elif self.state == "BRAKE":
-            self.brake_timer += 1
-            steer = self.compute_steering(current_lane_error, Ld, gain)
-            ignore_left_vehicle = self.obstacle_type == "vehicle" and self.obstacle_vehicle_side == "left"
-            ignore_right_vehicle_while_left = self.current_lane == "left" and self.obstacle_type == "vehicle" and self.obstacle_vehicle_side == "right"
-            if self.obstacle_type != "vehicle" or not self.obstacle_detected or self.obstacle_dist > self.resume_dist or ignore_left_vehicle or ignore_right_vehicle_while_left:
+        if self.state == "AVOID_CAR":
+            # Né tạm sang trái trong một khoảng thời gian cố định rồi tự quay lại lane following
+            self.avoid_car_timer += 1
+            steer = self.compute_steering(avoid_car_target_error, Ld, gain * self.lane_change_steer_gain)
+            speed = self.lane_change_speed
+            if self.avoid_car_timer >= self.car_avoid_hold_time:
+                self.get_logger().info("AVOID_CAR: hold time xong -> về LANE_FOLLOWING, tâm làn trở lại bình thường")
                 self.state = "LANE_FOLLOWING"
-                self.brake_timer = 0
-                self.lane_change_target = None
-            else:
-                speed = 0.0 if self.obstacle_dist <= self.stop_dist else self.slow_speed
-                if self.brake_timer >= self.brake_hold_time:
-                    if self.lane_change_target == "left":
-                        self.get_logger().info("BRAKE: hold complete -> initiating LANE_CHANGE_LEFT")
-                        self.state = "LANE_CHANGE_LEFT"
-                        self.lane_change_timer = 0
-                    elif self.lane_change_target == "right":
-                        self.get_logger().info("BRAKE: hold complete -> initiating LANE_CHANGE_RIGHT")
-                        self.state = "LANE_CHANGE_RIGHT"
-                        self.lane_change_timer = 0
-                    else:
-                        self.get_logger().info("BRAKE: hold complete but no lane target -> resuming LANE_FOLLOWING")
-                        self.state = "LANE_FOLLOWING"
-                        self.brake_timer = 0
+                self.avoid_car_timer = 0
+
+        elif self.state == "AVOID_OTHER":
+            target_error = left_lane_error if self.avoid_other_target_lane == "left" else right_lane_error
+            avoid_ld = max(self.lane_change_lookahead_min, Ld * 0.65)
+            steer = self.compute_steering(target_error, avoid_ld, gain * self.lane_change_steer_gain)
+            speed = self.slow_speed
+            reached = abs(self.lookahead_error - target_error) < self.other_lane_change_completion_error
+            obstacle_gone = not other_relevant or self.obstacle_dist > self.other_slow_dist
+            if reached or obstacle_gone:
+                if reached:
+                    self.get_logger().info(f"AVOID_OTHER: đạt tâm làn {self.avoid_other_target_lane} -> về LANE_FOLLOWING")
+                    self.current_lane = self.avoid_other_target_lane
+                else:
+                    self.get_logger().info("AVOID_OTHER: vật cản đã hết -> về LANE_FOLLOWING")
+                self.state = "LANE_FOLLOWING"
+                self.avoid_other_target_lane = None
 
         else:  # LANE_FOLLOWING
             steer = self.compute_steering(current_lane_error, Ld, gain)
             speed = self.target_speed
 
-            ignore_left_vehicle = self.obstacle_type == "vehicle" and self.obstacle_vehicle_side == "left"
-            ignore_right_vehicle_while_left = self.current_lane == "left" and self.obstacle_type == "vehicle" and self.obstacle_vehicle_side == "right"
-            current_lane_blocked = self.obstacle_type == "vehicle" and self.obstacle_detected and self.obstacle_dist <= self.lane_change_trigger_dist and not (ignore_left_vehicle or ignore_right_vehicle_while_left)
+            if car_relevant and self.obstacle_dist < self.car_avoid_dist:
+                self.get_logger().info(f"Vehicle obstacle (nửa phải đường) tại {self.obstacle_dist:.2f}m -> né tạm sang trái")
+                self.state = "AVOID_CAR"
+                self.avoid_car_timer = 0
+                steer = self.compute_steering(avoid_car_target_error, Ld, gain * self.lane_change_steer_gain)
+                speed = self.lane_change_speed
+            elif car_relevant and self.obstacle_dist < self.car_slow_dist:
+                speed = self.slow_speed
 
-            if self.current_lane == "left" and not self.obstacle_detected and self.lane_right_clear and self.lane_change_cooldown == 0:
-                self.get_logger().info("Left lane objective reached and right lane clear -> returning to right lane")
-                self.state = "LANE_CHANGE_RIGHT"
-                self.lane_change_timer = 0
-            elif self.current_lane == "left" and self.obstacle_dist > self.resume_dist and self.lane_right_clear and self.lane_change_cooldown == 0:
-                self.get_logger().info("Obstacle passed -> returning to right lane")
-                self.state = "LANE_CHANGE_RIGHT"
-                self.lane_change_timer = 0
-            elif current_lane_blocked:
-                self.get_logger().info(f"Current lane blocked by vehicle obstacle at {self.obstacle_dist:.2f} m -> slow down and prepare lane change")
-                self.state = "BRAKE"
-                self.brake_timer = 0
-                if self.obstacle_vehicle_side == "right" and self.lane_left_clear and self.lane_change_cooldown == 0:
-                    self.lane_change_target = "left"
-                    self.get_logger().info("BRAKE: vehicle obstacle on right road half -> plan LANE_CHANGE_LEFT after hold")
-                elif self.lane_left_clear and self.lane_change_cooldown == 0:
-                    self.lane_change_target = "left"
-                    self.get_logger().info("BRAKE: lane_left_clear -> plan LANE_CHANGE_LEFT after hold")
-                elif self.lane_right_clear and self.lane_change_cooldown == 0:
-                    self.lane_change_target = "right"
-                    self.get_logger().info("BRAKE: lane_right_clear -> plan LANE_CHANGE_RIGHT after hold")
+            elif other_relevant and self.obstacle_dist < self.other_slow_dist:
+                # Tìm tâm làn trống để né: ưu tiên làn khác với làn hiện tại
+                target_lane = None
+                if self.current_lane == "right" and self.lane_left_clear:
+                    target_lane = "left"
+                elif self.current_lane == "left" and self.lane_right_clear:
+                    target_lane = "right"
+
+                if target_lane is not None:
+                    self.get_logger().info(f"Other obstacle tại {self.obstacle_dist:.2f}m -> tìm tâm làn {target_lane}")
+                    self.state = "AVOID_OTHER"
+                    self.avoid_other_target_lane = target_lane
+                    target_error = left_lane_error if target_lane == "left" else right_lane_error
+                    avoid_ld = max(self.lane_change_lookahead_min, Ld * 0.65)
+                    steer = self.compute_steering(target_error, avoid_ld, gain * self.lane_change_steer_gain)
+                    speed = self.slow_speed
                 else:
-                    self.lane_change_target = None
-                    self.get_logger().info("BRAKE: no adjacent lane available, holding")
-                speed = 0.0 if self.obstacle_dist <= self.stop_dist else self.slow_speed
+                    # Không có làn trống để né -> chỉ giảm tốc, giữ nguyên làn
+                    speed = self.slow_speed
+
             if self.state == "LANE_FOLLOWING" and abs(steer) > 0.45:
                 speed = max(self.lane_change_speed, self.target_speed * 0.5)
 
