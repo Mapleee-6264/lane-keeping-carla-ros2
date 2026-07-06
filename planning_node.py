@@ -43,7 +43,7 @@ class PlanningNode(Node):
         self.lookahead_distance_min = 3.0
         self.lookahead_distance_max = 12.0
         self.lookahead_curve_buffer = 2.0
-        self.gain_straight = 0.9
+        self.gain_straight = 0.8
         self.gain_curve = 1.1
         self.max_steer = 0.6
 
@@ -57,7 +57,7 @@ class PlanningNode(Node):
         self.other_lane_change_completion_error = 5.0   # đạt tâm làn (sai số < 0.5m) -> về lane following
 
         # ---- Ngưỡng vật cản loại "vehicle" (xe hơi), chỉ xét khi ở nửa phải đường ----
-        self.car_slow_dist = 15.5            # < 15m: slow down
+        self.car_slow_dist = 16            # < 15m: slow down
         self.car_avoid_dist = 15.0            # < 8m: né tạm sang trái
         self.car_avoid_hold_time = 300       # số chu kỳ (2s @ 50Hz) giữ tâm làn tạm rồi tự trả về lane following
 
