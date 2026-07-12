@@ -23,7 +23,6 @@ setup(
             "planning_node = autonomous_driving.planning_node:main",
             "control_node = autonomous_driving.control_node:main",
             "live_plot_node = autonomous_driving.live_plot_node:main",
-            "npc_velocity_manager = autonomous_driving.npc_velocity_manager:main",
             "buzzer_node = autonomous_driving.buzzer_node:main",
         ],
     },
